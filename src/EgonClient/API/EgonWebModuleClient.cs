@@ -9,6 +9,7 @@ using System.Net;
 using System.Text;
 using System.Threading.Tasks;
 using System.Xml.Serialization;
+using System.Threading;
 
 namespace EgonAPI.API
 {
@@ -31,15 +32,22 @@ namespace EgonAPI.API
         private HttpClient _client;
         private bool _isHttpsEnabled = false;
         private string _deviceId = string.Empty;
-        private EgonData _configuration = null;
+        private static readonly SemaphoreSlim _discoverSlim = new SemaphoreSlim(1);
 
-        public EgonDescription Description { get; private set; }
+        private readonly EgonDescription _description;
 
+        /// <summary>
+        /// Ctor.
+        /// </summary>
+        /// <param name="description"><see cref="EgonDescription"/>.</param>
+        /// <param name="isHttpsEnabled">true to use HTTPS, false otherwise.</param>
         public EgonWebModuleClient(EgonDescription description, bool isHttpsEnabled = false)
         {
+            if(description == null) throw new ArgumentNullException("description");
+
             _client = new HttpClient();
             _isHttpsEnabled = isHttpsEnabled;
-            Description = description;
+            _description = description;
             RegisterEncodingProvider();
         }
 
@@ -58,12 +66,12 @@ namespace EgonAPI.API
         /// <returns>Authorization response that serves as device ID.</returns>
         public async Task<bool> AuthorizeAsync(string user, string password)
         {
-            if (Description == null)
-                throw new ArgumentNullException(nameof(Description));
+            if (_description == null)
+                throw new InvalidOperationException(nameof(_description));
 
             try
             {
-                _deviceId = await AuthorizeAsync(_client, Description, user, password, _isHttpsEnabled);
+                _deviceId = await AuthorizeAsync(_client, _description, user, password, _isHttpsEnabled);
             }
             catch (Exception)
             {
@@ -80,15 +88,13 @@ namespace EgonAPI.API
         /// <returns>Parsed <see cref="EgonData"/> response that contains all devices exposed through the web interface.</returns>
         public async Task<EgonData> GetConfigurationAsync()
         {
-            if (Description == null)
-                throw new ArgumentNullException(nameof(Description));
+            if (_description == null)
+                throw new ArgumentNullException(nameof(_description));
 
             if (string.IsNullOrEmpty(_deviceId))
                 throw new ArgumentNullException(nameof(_deviceId));
 
-            _configuration = await GetConfigurationAsync(_client, Description, _deviceId, _isHttpsEnabled);
-
-            return _configuration;
+            return await GetConfigurationAsync(_client, _description, _deviceId, _isHttpsEnabled);
         }
 
         /// <summary>
@@ -99,13 +105,13 @@ namespace EgonAPI.API
         /// <returns><see cref="true"/> if successful, <see cref="false"/> otherwise.</returns>
         public Task<bool> ExecuteActionAsync(string elementId, string action)
         {
-            if (Description == null)
-                throw new ArgumentNullException(nameof(Description));
+            if (_description == null)
+                throw new ArgumentNullException(nameof(_description));
 
             if (string.IsNullOrEmpty(_deviceId))
                 throw new ArgumentNullException(nameof(_deviceId));
 
-            return ExecuteActionAsync(_client, Description, _deviceId, elementId, action, _isHttpsEnabled);
+            return ExecuteActionAsync(_client, _description, _deviceId, elementId, action, _isHttpsEnabled);
         }
 
         /// <summary>
@@ -114,13 +120,13 @@ namespace EgonAPI.API
         /// <returns><see cref="true"/> if successful, <see cref="false"/> otherwise.</returns>
         public Task<bool> RefreshAsync()
         {
-            if (Description == null)
-                throw new ArgumentNullException(nameof(Description));
+            if (_description == null)
+                throw new ArgumentNullException(nameof(_description));
 
             if (string.IsNullOrEmpty(_deviceId))
                 throw new ArgumentNullException(nameof(_deviceId));
 
-            return RefreshAsync(_client, Description, _deviceId, _isHttpsEnabled);
+            return RefreshAsync(_client, _description, _deviceId, _isHttpsEnabled);
         }
 
         /// <summary>
@@ -130,13 +136,13 @@ namespace EgonAPI.API
         /// <returns><see cref="EgonData"/> that contains state of all devices.</returns>
         public Task<EgonData> GetStateAsync(string groupId = null)
         {
-            if (Description == null)
-                throw new ArgumentNullException(nameof(Description));
+            if (_description == null)
+                throw new ArgumentNullException(nameof(_description));
 
             if (string.IsNullOrEmpty(_deviceId))
                 throw new ArgumentNullException(nameof(_deviceId));
 
-            return GetStateAsync(_client, Description, _deviceId, groupId, _isHttpsEnabled);
+            return GetStateAsync(_client, _description, _deviceId, groupId, _isHttpsEnabled);
         }
 
         private static async Task<EgonData> ParseEgonData(HttpResponseMessage response)
@@ -186,12 +192,14 @@ namespace EgonAPI.API
         public static async Task<EgonDescription> DiscoverAsync(string networkIpAddress, int broadcastTimeout = EGON_BROADCAST_TIMEOUT)
         {
             EgonDescription result = null;
-            TaskCompletionSource<EgonDescription> tcs = new TaskCompletionSource<EgonDescription>();
-            IPEndPoint endPoint = new IPEndPoint(IPAddress.Any, EGON_BROADCAST_PORT + 1);
-            IPEndPoint broadcastEndpoint = new IPEndPoint(IPAddress.Parse(networkIpAddress), EGON_BROADCAST_PORT);
+            await _discoverSlim.WaitAsync();
 
             try
             {
+                TaskCompletionSource<EgonDescription> tcs = new TaskCompletionSource<EgonDescription>();
+                IPEndPoint endPoint = new IPEndPoint(IPAddress.Any, EGON_BROADCAST_PORT + 1);
+                IPEndPoint broadcastEndpoint = new IPEndPoint(IPAddress.Parse(networkIpAddress), EGON_BROADCAST_PORT);
+
                 using (UdpClient client = new UdpClient(endPoint))
                 {
                     UdpState s = new UdpState();
@@ -214,10 +222,48 @@ namespace EgonAPI.API
             }
             catch (Exception ex)
             {
+                // ignore and continue
                 Debug.WriteLine(ex.Message);
+            }
+            finally
+            {
+                _discoverSlim.Release();
             }
 
             return result;
+        }
+
+        /// <summary>
+        /// Create description from the broadcast respose.
+        /// </summary>
+        /// <param name="response">Response example: EGO-N,MAC=XX:XX:XX:XX:XX:XX,PORT=2af9,IPADDR=192.168.1.XXX,MASK=255.255.255.0,GATEWAY=192.168.1.1,DNS1=192.168.1.1,VERSION=25</param>
+        /// <returns><see cref="EgonDescription"/>.</returns>
+        /// <exception cref="NotSupportedException"></exception>
+        private static EgonDescription CreateDescriptionFromBroadcastResponse(string response)
+        {
+            if (response.StartsWith("EGO-N,"))
+                response = response.Substring(6);
+            else
+                throw new NotSupportedException(response);
+
+            string[] splittedProperties = response.Split(',', '=');
+            if (splittedProperties.Count() < 14)
+                throw new NotSupportedException();
+
+            var result = new Dictionary<string, string>();
+            for (var i = 0; i < splittedProperties.Length; i += 2)
+            {
+                result.Add(splittedProperties[i], splittedProperties[i + 1]);
+            }
+
+            return new EgonDescription(
+                result["MAC"],
+                result["PORT"],
+                result["IPADDR"],
+                result["MASK"],
+                result["GATEWAY"],
+                result["DNS1"],
+                result["VERSION"]);
         }
 
         private static void MessageReceived(IAsyncResult result)
@@ -232,7 +278,7 @@ namespace EgonAPI.API
             {
                 try
                 {
-                    EgonDescription description = EgonDescription.FromBroadcastResponse(message);
+                    EgonDescription description = CreateDescriptionFromBroadcastResponse(message);
                     resultTaskCompletionSource.TrySetResult(description);
                     return;
                 }
@@ -263,17 +309,9 @@ namespace EgonAPI.API
                 password,
                 user);
 
-            try
+            using (HttpResponseMessage authorizationResponse = await client.GetAsync(new Uri(authorizationRequest, UriKind.Absolute)))
             {
-                using (HttpResponseMessage authorizationResponse = await client.GetAsync(new Uri(authorizationRequest, UriKind.Absolute)))
-                {
-                    return await authorizationResponse.Content.ReadAsStringAsync();
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine(ex.Message);
-                return null;
+                return await authorizationResponse.Content.ReadAsStringAsync();
             }
         }
 
@@ -293,17 +331,9 @@ namespace EgonAPI.API
                 GetPort(isHttpsEnabled),
                 device);
 
-            try
+            using (HttpResponseMessage configResponse = await client.GetAsync(new Uri(configRequest, UriKind.Absolute)))
             {
-                using (HttpResponseMessage configResponse = await client.GetAsync(new Uri(configRequest, UriKind.Absolute)))
-                {
-                    return await ParseEgonData(configResponse);
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine(ex.Message);
-                return null;
+                return await ParseEgonData(configResponse);
             }
         }
 
@@ -327,18 +357,10 @@ namespace EgonAPI.API
                 device,
                 elementId);
 
-            try
+            using (HttpResponseMessage actionResponse = await client.GetAsync(new Uri(actionRequest, UriKind.Absolute)))
             {
-                using (HttpResponseMessage actionResponse = await client.GetAsync(new Uri(actionRequest, UriKind.Absolute)))
-                {
-                    string result = await actionResponse.Content.ReadAsStringAsync();
-                    return string.Compare("OK", result) == 0;
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine(ex.Message);
-                return false;
+                string result = await actionResponse.Content.ReadAsStringAsync();
+                return string.Compare("OK", result) == 0;
             }
         }
 
@@ -358,18 +380,10 @@ namespace EgonAPI.API
                 GetPort(isHttpsEnabled),
                 device);
 
-            try
+            using (HttpResponseMessage refreshResponse = await client.GetAsync(new Uri(refreshRequest, UriKind.Absolute)))
             {
-                using (HttpResponseMessage refreshResponse = await client.GetAsync(new Uri(refreshRequest, UriKind.Absolute)))
-                {
-                    string result = await refreshResponse.Content.ReadAsStringAsync();
-                    return string.Compare("OK", result) == 0;
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine(ex.Message);
-                return false;
+                string result = await refreshResponse.Content.ReadAsStringAsync();
+                return string.Compare("OK", result) == 0;
             }
         }
 
@@ -391,17 +405,9 @@ namespace EgonAPI.API
                 device,
                 string.IsNullOrEmpty(groupId) ? string.Empty : "&group=" + groupId);
 
-            try
+            using (HttpResponseMessage stateResponse = await client.GetAsync(new Uri(stateRequest, UriKind.Absolute)))
             {
-                using (HttpResponseMessage stateResponse = await client.GetAsync(new Uri(stateRequest, UriKind.Absolute)))
-                {
-                    return await ParseEgonData(stateResponse);
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine(ex.Message);
-                return null;
+                return await ParseEgonData(stateResponse);
             }
         }
 

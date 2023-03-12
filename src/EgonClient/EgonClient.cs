@@ -1,52 +1,54 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using EgonAPI.API;
 using EgonAPI.Model;
 
 namespace EgonAPI
 {
+    /// <summary>
+    /// ABB Egon client.
+    /// </summary>
     public class EgonClient : IDisposable
     {
         private const int EGON_REPEAT_INTERVAL = 3000; // 3 seconds before repeating the query
+        private const int EGON_BROADCAST_TIMEOUT = 10000; // 10 seconds broadcast timeout
 
         private readonly string _user;
         private readonly string _password;
         private readonly EgonWebModuleClient _client;
+        private readonly SemaphoreSlim _refreshSlim = new SemaphoreSlim(1);
 
-        private Dictionary<string, EgonDeviceModel> devices = new Dictionary<string, EgonDeviceModel>();
-
-        public Dictionary<string, EgonDeviceModel> Devices
+        /// <summary>
+        /// Ctor.
+        /// </summary>
+        /// <param name="description"><see cref="EgonDescription"/>.</param>
+        /// <param name="user">User name.</param>
+        /// <param name="password">Password.</param>
+        public EgonClient(EgonDescription description, string user, string password)
         {
-            get { return devices; }
-            private set { devices = value; }
-        }
+            if(description == null) 
+                throw new ArgumentNullException(nameof(description));
 
-        private List<EgonGroupModel> groups = new List<EgonGroupModel>();
-
-        public List<EgonGroupModel> Groups
-        {
-            get { return groups; }
-            private set { groups = value; }
-        }
-
-        public EgonClient(EgonDescription description, string user, string password, bool isHttpsEnabled = false)
-        {
-            this._client = new EgonWebModuleClient(description, isHttpsEnabled);
+            this._client = new EgonWebModuleClient(description);
             this._user = user;
             this._password = password;
         }
 
-        public async Task<bool> InitializeAsync()
+        /// <summary>
+        /// Get Egon configuration.
+        /// </summary>
+        /// <returns><see cref="EgonConfiguration"/>.</returns>
+        public async Task<EgonConfiguration> GetConfigurationAsync()
         {
-            bool isAuthorized = false;
             int attempts = 0;
             const int maxAttempts = 10; // maximum number of attempts to make
-            Dictionary<string, EgonDeviceModel> devices = new Dictionary<string, EgonDeviceModel>();
-            List<EgonGroupModel> groups = new List<EgonGroupModel>();
+            Dictionary<string, EgonDevice> devices = new Dictionary<string, EgonDevice>();
+            List<Model.EgonGroup> groups = new List<Model.EgonGroup>();
 
-            isAuthorized = await _client.AuthorizeAsync(_user, _password);
+            bool isAuthorized = await _client.AuthorizeAsync(_user, _password);
             if (isAuthorized)
             {
                 EgonData data = null;
@@ -57,7 +59,7 @@ namespace EgonAPI
                     {
                         foreach (var e in data.Elements)
                         {
-                            EgonDeviceModel device = EgonDeviceModel.FromData(e);
+                            EgonDevice device = CreateDeviceModel(e);
                             devices.Add(device.Id, device);
                         }
 
@@ -73,7 +75,7 @@ namespace EgonAPI
                                     if (groupData.ElementStates == null || groupData.ElementStates.Count() == 0)
                                         continue;
 
-                                    EgonGroupModel egonGroup = EgonGroupModel.FromData(group, groupData.ElementStates);
+                                    Model.EgonGroup egonGroup = CreateGroupModel(group, groupData.ElementStates);
                                     groups.Add(egonGroup);
                                 }
                                 else
@@ -86,13 +88,10 @@ namespace EgonAPI
                             }
                         }
 
-                        this.Devices = devices;
-                        this.Groups = groups;
-
-                        // get realtime data
-                        await RefreshAsync();
-
-                        return true;
+                        EgonConfiguration configuration = new EgonConfiguration();
+                        configuration.Devices = devices;
+                        configuration.Groups = groups;
+                        return configuration;
                     }
                     else
                     {
@@ -104,61 +103,100 @@ namespace EgonAPI
                 }
             }
 
-            return false;
+            return null;
         }
 
-        public async Task RefreshAsync()
+        /// <summary>
+        /// Queries the current state of all devices and returns the list of changes.
+        /// </summary>
+        /// <param name="egonConfiguration"><see cref="EgonConfiguration"/>.</param>
+        /// <returns>A <see cref="List{T}"/> of devices that had a state change since the last refresh.</returns>
+        /// <exception cref="UnauthorizedAccessException"></exception>
+        public async Task<IList<EgonDevice>> GetCurrentStateAsync(EgonConfiguration egonConfiguration)
         {
-            bool isAuthorized;
-            isAuthorized = await _client.AuthorizeAsync(_user, _password);
-            if (isAuthorized)
+            await _refreshSlim.WaitAsync();
+
+            try
             {
+                bool isAuthorized = await _client.AuthorizeAsync(_user, _password);
+
+                if (!isAuthorized)
+                    throw new UnauthorizedAccessException();
+
                 await _client.RefreshAsync();
+
                 EgonData state = await _client.GetStateAsync();
+                List<EgonDevice> updatedDevices = new List<EgonDevice>();
 
                 if (state != null)
                 {
                     for (int i = 0; i < state.ElementStates.Length; i++)
                     {
                         EgonElementState currentElementState = state.ElementStates[i];
-                        EgonDeviceModel foundDevice;
+                        EgonDevice foundDevice;
 
-                        if (Devices.TryGetValue(currentElementState.Id, out foundDevice))
+                        if (egonConfiguration.Devices.TryGetValue(currentElementState.Id, out foundDevice))
                         {
+                            if (string.Compare(foundDevice.CurrentValue, currentElementState.Value) != 0)
+                            {
+                                // device state has changed
+                                updatedDevices.Add(foundDevice);
+                            }
+
                             foundDevice.CurrentValue = currentElementState.Value;
                         }
                     }
                 }
-            }
-        }
 
-        public EgonConfigurationModel GetConfiguration()
-        {
-            EgonConfigurationModel configuration = new EgonConfigurationModel();
-            configuration.Devices = this.Devices.Values.ToList();
-            configuration.Groups = this.Groups;
-            return configuration;
+                return updatedDevices;
+            }
+            finally
+            {
+                _refreshSlim.Release();
+            }
         }
 
         /// <summary>
         /// Execute an action.
         /// </summary>
+        /// <param name="elementId">Egon element ID.</param>
+        /// <param name="action"><see cref="EgonActions"/>.</param>
         /// <returns><see cref="true"/> if successful, <see cref="false"/> otherwise.</returns>
         public async Task<bool> ExecuteActionAsync(string elementId, string action)
         {
-            bool isAuthorized;
-            isAuthorized = await _client.AuthorizeAsync(_user, _password);
-            if (isAuthorized)
-            {
-                return await _client.ExecuteActionAsync(elementId, action);
-            }
-
-            return false;
+            bool isAuthorized = await _client.AuthorizeAsync(_user, _password);
+            return isAuthorized && await _client.ExecuteActionAsync(elementId, action);
         }
 
-        public static Task<EgonDescription> DiscoverAsync(string networkIpAddress, int broadcastTimeout = 10000)
+        /// <summary>
+        /// Discover Egon in the local network.
+        /// </summary>
+        /// <param name="networkIpAddress">Network IP address, e.g. 192.168.1.255.</param>
+        /// <param name="broadcastTimeout">Broadcast timeout. <see cref="EGON_BROADCAST_TIMEOUT"/>.</param>
+        /// <returns></returns>
+        public static Task<EgonDescription> DiscoverAsync(string networkIpAddress, int broadcastTimeout = EGON_BROADCAST_TIMEOUT)
         {
             return EgonWebModuleClient.DiscoverAsync(networkIpAddress, broadcastTimeout);
+        }
+
+        private static EgonDevice CreateDeviceModel(API.EgonElement e)
+        {
+            EgonDevice d = new EgonDevice();
+            d.CurrentValue = e.Value;
+            d.Id = e.Id;
+            d.IsEnabled = "true".CompareTo(e.Enabled) == 0;
+            d.Name = e.Name;
+            d.DeviceType = e.Type;
+            return d;
+        }
+
+        private static Model.EgonGroup CreateGroupModel(API.EgonGroup g, API.EgonElementState[] element_states)
+        {
+            Model.EgonGroup eg = new Model.EgonGroup();
+            eg.Id = g.Id;
+            eg.Name = g.Name;
+            eg.Devices = element_states.Select(x => x.Id).ToList();
+            return eg;
         }
 
         #region IDisposable Support
