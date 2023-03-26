@@ -256,14 +256,15 @@ namespace EgonAPI.API
                 result.Add(splittedProperties[i], splittedProperties[i + 1]);
             }
 
-            return new EgonDescription(
-                result["MAC"],
-                result["PORT"],
-                result["IPADDR"],
-                result["MASK"],
-                result["GATEWAY"],
-                result["DNS1"],
-                result["VERSION"]);
+            return new EgonDescription() {
+                MAC = result["MAC"],
+                Port = result["PORT"],
+                IpAddr = result["IPADDR"],
+                Mask = result["MASK"],
+                Gateway = result["GATEWAY"],
+                Dns1 = result["DNS1"],
+                Version = result["VERSION"]
+            };
         }
 
         private static void MessageReceived(IAsyncResult result)
